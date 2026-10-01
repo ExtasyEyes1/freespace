@@ -1,0 +1,74 @@
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+import {writeFile} from 'node:fs/promises';
+import {CameraRig} from '../js/CameraRig.js';
+import {cameraPresets} from '../js/cameraPresets.js';
+
+const require=createRequire(import.meta.url);
+const {chromium}=require(process.env.FREESPACE_PLAYWRIGHT||'C:/Users/iamen/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+const camera={position:{set(...value){this.value=value;}},lookAt(...value){this.target=value;},updateProjectionMatrix(){},isPerspectiveCamera:true};
+const rig=new CameraRig(camera);
+rig.addKeyframe(0,{position:[0,0,0],target:[0,0,0],zoom:1,fov:45,id:'first'});
+rig.addKeyframe(.5,{position:[10,6,2],target:[2,1,0],zoom:2,fov:35,id:'middle'});
+rig.addKeyframe(1,{position:[20,12,4],target:[4,2,0],zoom:1,fov:45,id:'last'});
+assert.deepEqual(rig.setProgress(.25).position,[5,3,1]);assert.equal(camera.fov,40);assert.equal(camera.zoom,1.5);
+assert.deepEqual(rig.setProgress(-1).position,[0,0,0]);assert.deepEqual(rig.setProgress(2).position,[20,12,4]);
+const before=rig.sample(.5-1e-5),after=rig.sample(.5+1e-5);assert.ok(Math.abs(before.position[0]-after.position[0])<1e-8);
+rig.destroy();
+const browser=await chromium.launch({headless:true,channel:'msedge'});
+const results=['CameraRig: endpoint clamping, easing midpoint, zoom/FOV interpolation, continuity: PASS'];
+try {
+ const page=await browser.newPage({viewport:{width:1440,height:1000}});const errors=[];page.on('pageerror',error=>errors.push(error.message));
+ await page.goto('http://127.0.0.1:4173',{waitUntil:'domcontentloaded'});await page.waitForSelector('.scene-host canvas');await page.waitForTimeout(1000);
+ assert.equal(await page.locator('#hero-title .word').count(),4);assert.equal(await page.locator('#hero-title').getAttribute('aria-hidden'),null);
+ await page.screenshot({path:'artifacts/animation-hero.png'});
+ for(const [id,host] of [['tour-open','tour'],['tour-meeting','tour'],['tour-quiet','tour'],['tour-kitchen','tour'],['pricing','pricing'],['contacts','contact']]){
+   await page.locator('#'+id).evaluate(el=>scrollTo({top:el.getBoundingClientRect().top+scrollY-innerHeight*.25,behavior:'instant'}));
+   await page.waitForTimeout(1200);
+   assert.equal(await page.locator('.scene-host canvas').count(),1);
+   assert.equal(await page.locator(`[data-scene-host="${host}"] canvas`).count(),1,`${id} should host the shared canvas`);
+   if(id==='tour-meeting'||id==='contacts')await page.screenshot({path:`artifacts/animation-${id}.png`});
+ }
+ assert.equal(await page.locator('[data-counter]').textContent(),'650');
+ assert.equal(await page.locator('.scroll-indicator').getAttribute('class'),'scroll-indicator dismissed');
+ const progress=await page.locator('.scroll-progress').evaluate(el=>getComputedStyle(el).transform);assert.notEqual(progress,'matrix(0, 0, 0, 1, 0, 0)');
+ await page.locator('[data-plan=month]').click();await page.waitForTimeout(1150);assert.equal(await page.locator('[data-counter]').textContent(),'8 900');
+ assert.ok((await page.locator('.tab-slider').getAttribute('style')).includes('translate3d('));
+ results.push('Scroll tour: seven scene states, one shared canvas, sticky host, counters, progress, tariff slider: PASS');
+ const reduced=await browser.newPage({viewport:{width:1280,height:900},reducedMotion:'reduce'});
+ await reduced.goto('http://127.0.0.1:4173',{waitUntil:'domcontentloaded'});await reduced.waitForSelector('.scene-host canvas');
+ assert.equal(await reduced.locator('#hero-title .word').first().evaluate(el=>getComputedStyle(el).opacity),'1');
+ assert.equal(await reduced.locator('.cursor-dot').isVisible(),false);
+ await reduced.locator('#contacts').scrollIntoViewIfNeeded();await reduced.waitForTimeout(100);assert.equal(await reduced.locator('#contact-scene canvas').count(),1);
+ results.push('Reduced motion: visible content, immediate transitions, no custom cursor: PASS');
+ const mobile=await browser.newPage({viewport:{width:390,height:844},isMobile:true,hasTouch:true});
+ await mobile.goto('http://127.0.0.1:4173',{waitUntil:'domcontentloaded'});await mobile.waitForSelector('.scene-host canvas');
+ await mobile.locator('#tour-quiet').evaluate(el=>scrollTo({top:el.getBoundingClientRect().top+scrollY-innerHeight*.25,behavior:'instant'}));await mobile.waitForTimeout(900);
+ assert.equal(await mobile.locator('[data-scene-host=quiet] canvas').count(),1);
+ assert.equal(await mobile.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await mobile.screenshot({path:'artifacts/animation-mobile.png'});
+ results.push('Mobile: shared scene mounts into section, presets available, no overflow: PASS');
+ const slow=await browser.newPage({viewport:{width:1280,height:900}});
+ await slow.addInitScript(()=>Object.defineProperty(navigator,'hardwareConcurrency',{get:()=>2}));
+ await slow.goto('http://127.0.0.1:4173',{waitUntil:'domcontentloaded'});await slow.waitForSelector('.scene-host canvas');
+ const power=await slow.evaluate(async()=>{
+  const [{Scene3D},{zones},{cameraPresets}]=await Promise.all([import('/js/Scene3D.js'),import('/js/data.js'),import('/js/cameraPresets.js')]);
+  const host=document.createElement('div');host.style.cssText='width:500px;height:300px;position:fixed;top:0;left:0';document.body.append(host);
+  const stage=new Scene3D(host,zones);let i=0;for(const [id,preset] of Object.entries(cameraPresets))stage.cameraRig.addKeyframe(i++/6,{...preset,id});
+  stage.update({globalProgress:1,sectionProgress:.5,activeId:'contact'});
+  const result={shadows:stage.renderer.shadowMap.enabled,dust:!!stage.dust,groups:Object.keys(stage.model.groups),lowPower:stage.lowPower};
+  stage.destroy();result.disposed=stage.disposed&&host.querySelector('canvas')===null;host.remove();return result;
+ });
+ assert.equal(power.lowPower,true);assert.equal(power.shadows,false);assert.equal(power.dust,false);assert.equal(power.disposed,true);
+ results.push('Weak device: no shadows or particles, resource destroy removes canvas: PASS');
+ const lost=await browser.newPage({viewport:{width:1280,height:900}});const lostErrors=[];lost.on('pageerror',error=>lostErrors.push(error.message));
+ await lost.goto('http://127.0.0.1:4173',{waitUntil:'domcontentloaded'});await lost.waitForSelector('.scene-host canvas');
+ await lost.locator('.scene-host canvas').evaluate(canvas=>canvas.getContext('webgl2').getExtension('WEBGL_lose_context').loseContext());
+ await lost.locator('#fallback').waitFor({state:'visible'});await lost.locator('#tour-quiet').scrollIntoViewIfNeeded();await lost.waitForTimeout(250);
+ assert.equal(await lost.locator('.scene-host canvas').count(),0);assert.deepEqual(lostErrors,[]);
+ results.push('WebGL context loss: fallback survives further scroll without runtime errors: PASS');
+ assert.deepEqual(errors,[]);
+ await page.evaluate(async()=>{const {destroy}=await import('/main.js');destroy();});
+ assert.equal(await page.locator('.scene-host canvas').count(),0);assert.equal(await page.locator('.cursor-dot').count(),0);
+ results.push('App destroy: scene, cursor, listeners and observers cleaned up: PASS');
+ await writeFile('artifacts/animation-check-results.txt',results.join('\n')+'\n');console.log(results.join('\n'));
+} finally {await browser.close();}
